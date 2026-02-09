@@ -20,9 +20,9 @@ process.on('uncaughtException', console.error);
 bot.start(ctx => {
     ctx.reply(
         '🎥 *Smart YouTube Bot*\n\n' +
-        '• Short videos → stream quickly\n' +
+        '• Short videos (≤2min) → stream instantly\n' +
         '• Long videos → download & send\n\n' +
-        'Send a YouTube link.',
+        'Send a YouTube link to start!',
         { parse_mode: 'Markdown' }
     );
 });
@@ -32,13 +32,21 @@ bot.on('text', async ctx => {
     const url = ctx.message.text.trim();
 
     if (!ytdl.validateURL(url)) {
-        return ctx.reply('❌ Invalid YouTube link');
+        return ctx.reply('❌ Invalid YouTube link!\n\nSend a valid YouTube URL.');
     }
 
     const statusMsg = await ctx.reply('⏳ Fetching video info...');
 
     try {
-        const info = await ytdl.getInfo(url);
+        // FIXED: Added User-Agent to bypass age verification
+        const info = await ytdl.getInfo(url, {
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                }
+            }
+        });
+
         const v = info.videoDetails;
         const title = v.title.slice(0, 50);
         const duration = Number(v.lengthSeconds);
@@ -47,7 +55,7 @@ bot.on('text', async ctx => {
             ctx.chat.id,
             statusMsg.message_id,
             undefined,
-            `🎥 ${title}\n⬇️ Downloading...`
+            `🎥 ${title}\n⬇️ Preparing video... (${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, '0')})`
         );
 
         if (duration <= 120) {
@@ -59,36 +67,55 @@ bot.on('text', async ctx => {
         }
 
     } catch (err) {
-        console.error(err);
+        console.error('Video processing error:', err.message);
         await ctx.telegram.editMessageText(
             ctx.chat.id,
             statusMsg.message_id,
             undefined,
-            '❌ Failed to process video'
+            `❌ Failed to process video:\n\`${err.message}\`\n\nTry another link!`,
+            { parse_mode: 'Markdown' }
         );
     }
 });
 
-// ===== STREAM SHORT VIDEO =====
+// ===== STREAM SHORT VIDEO (<= 2min) =====
 async function streamVideo(ctx, url, title, duration, statusMsg) {
     try {
-        const stream = ytdl(url, { filter: f => f.hasVideo && f.hasAudio, quality: '18' });
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            statusMsg.message_id,
+            undefined,
+            `🎥 ${title}\n📡 Streaming...`
+        );
+
+        // FIXED: User-Agent + reliable quality
+        const stream = ytdl(url, {
+            filter: f => f.hasVideo && f.hasAudio,
+            quality: ['18', '22', '137+140'], // Fallback qualities
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            }
+        });
 
         await ctx.telegram.sendVideo(
             ctx.chat.id,
             stream,
             {
-                caption: `🎥 ${title}\n⏱️ ${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, '0')}`,
-                supports_streaming: true
+                caption: `🎥 ${title}\n⏱️ ${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, '0')}\n✨ Streamed instantly!`,
+                supports_streaming: true,
+                thumbnail: undefined // Avoid thumbnail issues
             }
         );
 
         await ctx.deleteMessage(statusMsg.message_id);
-        ctx.reply('✨ Streamed successfully!');
+        ctx.reply('✨ Video streamed successfully!');
 
     } catch (err) {
-        console.log('Stream failed, falling back to download...', err);
-        await downloadVideo(ctx, url, title, duration, statusMsg);
+        console.log('Stream failed, trying download...', err.message);
+        await ctx.deleteMessage(statusMsg.message_id);
+        await downloadVideo(ctx, url, title, duration);
     }
 }
 
@@ -97,46 +124,92 @@ async function downloadVideo(ctx, url, title, duration, statusMsg) {
     const filename = `${Date.now()}-${title.replace(/[^a-z0-9]/gi, '_')}.mp4`;
     const filepath = path.join(tempDir, filename);
 
-    const stream = ytdl(url, { filter: f => f.hasVideo && f.hasAudio && f.container === 'mp4', quality: 'highest' });
-    const write = fs.createWriteStream(filepath);
-    stream.pipe(write);
-
-    await new Promise((resolve, reject) => {
-        stream.on('error', reject);
-        write.on('error', reject);
-        write.on('finish', resolve);
-    });
-
-    const sizeMB = fs.statSync(filepath).size / (1024 * 1024);
-    if (sizeMB > 48) {
-        fs.unlinkSync(filepath);
-        return ctx.telegram.editMessageText(
+    try {
+        await ctx.telegram.editMessageText(
             ctx.chat.id,
             statusMsg.message_id,
             undefined,
-            '📦 Video too large (max 48MB)'
+            `🎥 ${title}\n⬇️ Downloading...`
+        );
+
+        // FIXED: Reliable quality selection + User-Agent
+        const stream = ytdl(url, {
+            filter: f => f.hasVideo && f.hasAudio && f.container === 'mp4',
+            quality: 'highestvideo[height<=720]+bestaudio[ext=m4a]/best[ext=mp4]',
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            }
+        });
+
+        const write = fs.createWriteStream(filepath);
+        stream.pipe(write);
+
+        await new Promise((resolve, reject) => {
+            stream.on('error', reject);
+            write.on('error', reject);
+            write.on('finish', () => {
+                console.log('Download finished:', filepath);
+                resolve();
+            });
+        });
+
+        const stats = fs.statSync(filepath);
+        const sizeMB = stats.size / (1024 * 1024);
+
+        if (sizeMB > 48) {
+            fs.unlinkSync(filepath);
+            await ctx.telegram.editMessageText(
+                ctx.chat.id,
+                statusMsg.message_id,
+                undefined,
+                `📦 Video too large (${sizeMB.toFixed(1)}MB)\nMax: 48MB`
+            );
+            return;
+        }
+
+        await ctx.telegram.sendVideo(
+            ctx.chat.id,
+            { source: filepath },
+            {
+                caption: `🎥 ${title}\n⏱️ ${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, '0')}\n📥 ${sizeMB.toFixed(1)}MB`,
+                supports_streaming: true
+            }
+        );
+
+        // Cleanup
+        fs.unlinkSync(filepath);
+        await ctx.deleteMessage(statusMsg.message_id);
+        ctx.reply('✅ Downloaded & sent successfully!');
+
+    } catch (err) {
+        console.error('Download error:', err.message);
+        if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
+        await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            statusMsg.message_id,
+            undefined,
+            `❌ Download failed:\n\`${err.message}\``,
+            { parse_mode: 'Markdown' }
         );
     }
-
-    await ctx.telegram.sendVideo(
-        ctx.chat.id,
-        { source: filepath },
-        {
-            caption: `🎥 ${title}\n⏱️ ${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, '0')}`,
-            supports_streaming: true
-        }
-    );
-
-    fs.unlinkSync(filepath);
-    await ctx.deleteMessage(statusMsg.message_id);
-    ctx.reply('✅ Downloaded & sent successfully!');
 }
 
 // ===== LAUNCH BOT =====
 bot.launch()
-    .then(() => console.log('🤖 Smart YouTube Bot running (polling mode)'))
-    .catch(err => console.error('BOT FAILED TO START:', err));
+    .then(() => console.log('🤖 YouTube Bot running on Render!'))
+    .catch(err => console.error('BOT FAILED:', err));
 
-// ===== CLEAN EXIT =====
-process.once('SIGINT', () => { if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true }); bot.stop('SIGINT'); });
-process.once('SIGTERM', () => { if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true }); bot.stop('SIGTERM'); });
+// ===== GRACEFUL SHUTDOWN =====
+process.once('SIGINT', () => {
+    console.log('SIGINT received, cleaning up...');
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true });
+    bot.stop('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+    console.log('SIGTERM received, cleaning up...');
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true });
+    bot.stop('SIGTERM');
+});
